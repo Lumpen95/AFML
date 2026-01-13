@@ -1,0 +1,2 @@
+# AFML
+Marcos Lopez de Prado - Advances in Financial Machine Learning-Wiley (2018)
