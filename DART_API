@@ -1,0 +1,41 @@
+library(tidyverse)
+library(jsonlite)
+library(httr)
+library(xml2)
+
+url <- "https://opendart.fss.or.kr/api/corpCode.xml"
+
+url <- paste0(url, "?crtfc_key=", crtfc_key)
+
+res <- GET(
+  url = url
+)
+
+xml_text <- content(res, as = "text", encoding = "UTF-8")
+read_xml(xml_text)
+
+# zip 파일로 저장
+zip_path <- "corpCode.zip"
+writeBin(content(res, "raw"), zip_path)
+unzip(zip_path, exdir = "corpCode")
+xml_path <- "corpCode/CORPCODE.xml"
+doc <- read_xml(xml_path, encoding = "UTF-8")
+
+
+xml_list <- xml_children(xml_children(doc)) |> xml_contents() |> as.character()
+
+dt <- data.table::data.table(xml_list)
+dt[, grp := ceiling(.I/5)]
+dt <- dt[, as.list(xml_list), by = grp][,-1][,.(corp_name = V2, corp_code = V1)]
+dt[corp_name == "새중앙새마을금고", corp_code]
+
+
+
+
+url <- "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
+
+crtfc_key <- "bd78c425056b074d1c9a09985855675212e2634a"
+
+corp_code <- ""
+bsns_year <- "2025"
+reprt_code <- "11014"
