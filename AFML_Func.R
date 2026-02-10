@@ -61,7 +61,7 @@ ewmsd <- function(x, alpha = NULL, span = NULL, bias = FALSE) {
 # x(Numeric vector): 국지적 정상성을 가진 IID 관측값(로그 수익률)
 # h(Numeric vector): 구조적 변화를 판단할 수 있는 동적 임계값(지수가중 이동표준편차)
 # return(Numeric vector): 이벤트 발생 Index
-getTEvents <- function(x, h) {
+sym_cumsum <- function(x, h) {
   
   if (!is.numeric(x) || !is.vector(x)) stop("x는 정수형 벡터여야 합니다.")
   if (!is.numeric(h) || !is.vector(h)) stop("h는 정수형 벡터여야 합니다.")
@@ -141,25 +141,6 @@ getConcurrentBar <- function(closeidx, events) {
     count[overlap] <- count[overlap] + 1L
   }
   return(count)
-}
-
-getAvgUniqueness <- function(events, numCoEvents) {
-  wght <- numeric(nrow(events))
-  names(wght) <- events$t0
-  
-  for (i in seq_len(nrow(events))) {
-    t_in <- events$t0[i]
-    t_out <- events$t1[i]
-    
-    ct_slice <- numCoEvents[
-      names(numCoEvents) >= t_in & names(numCoEvents) <= t_out
-    ]
-    
-    ct_slice <- ct_slice[ct_slice > 0]
-    wght[i] <- mean(1 / ct_slice)
-  }
-  
-  return(wght)
 }
 
 getIndMatrix <- function(index, events) {
@@ -597,7 +578,7 @@ featImpMDA <- function(data, cv, case_weights, num_trees = 1000, sample_fraction
   # base_score: 순열 전 oos score
   # perm_score: 특정 칼럼 순열 후 oos score
   # imp = (perm_score - base_score) / abs(base_score)
-  imp_norm <- sweep(-perm_score, 1, base_score, FUN = "+") / -perm_score
+  imp_norm <- sweep(-perm_score, 1, base_score, FUN = "+") / abs(base_score)
   
   imp <- tibble(
     feature = colnames(imp_norm),
@@ -692,4 +673,135 @@ apply_etf_trick <- function(
     
   }
   return(K)
+}
+
+sign_entropy <- function(x) {
+  x <- x[!is.na(x)]
+  p <- table(x) / length(x)
+  -sum(p * log(p))
+}
+
+signed_avg_rl <- function(sign) {
+  r <- rle(sign)
+  sum(r$values * r$lengths) / sum(r$lengths)
+}
+
+computeCSW <- function(ret) {
+  T <- length(ret)
+  dy <- diff(ret)
+  
+  s <- rep(NA, T)
+  
+  for (t in 2:T) {
+    sigma_t <- sqrt(mean(dy[1:(t-1)]^2))
+    if (sigma_t == 0) next
+    s[t] <- sum(dy[1:(t-1)]) / sigma_t
+  }
+  return(s)
+}
+
+validate_sym <- function(sym_idx, csw_stat, csw_threshhold, embargo = 5) {
+  
+  valid_events <- c()
+  
+  for (t in sym_idx) {
+    
+    # 구조적 붕괴 근처 이벤트 제거
+    if (abs(csw_stat[t]) > csw_threshhold) next
+    
+    # 구조적 붕괴 시점
+    unstable_zone <- which(abs(csw_stat) > csw_threshhold)
+    # 해당 이벤트 시점과 구조적 붕괴 시점 차이가 엠바고 인자 일수 이내 인지 확인
+    if (any(abs(unstable_zone - t) <= embargo)) next
+    
+    valid_events <- c(valid_events, t)
+  }
+  return(valid_events)
+}
+
+safe_FastSampEn <- function(x) {
+  if (anyNA(x)) return(NA_real_)
+  TSEntropies::FastSampEn(x)
+}
+
+matchLength <- function(msg, i, window) {
+  # i : 현재 기준 위치
+  # j : 과거 비교 위치
+  # l : 지금까지 일치한 길이
+  N <- nchar(msg)
+  
+  # 초기 검색 구간 설정
+  if (is.null(window)) {
+    j_start <- 1
+  } else {
+    j_start <- max(1, i - window)
+  }
+  
+  j_end <- i - 1
+  max_l <- 0
+  
+  for (j in j_start:j_end) {
+    l <- 0
+    repeat {
+      if ((i + l > N) || (j + l >= i)) break
+      # i + l: 현재 위치에서 l 번째 글자
+      # j + l: 과거 위치에서 l 번째 글자
+      if (substr(msg, i + l, i + l) == substr(msg, j + l, j + l)) {
+        l <- l + 1
+      } else {
+        break
+      }
+    }
+    max_l <- max(max_l, l)
+  }
+  return(list(
+    l = max_l + 1,
+    substr = substr(msg, i, i + max_l)
+  ))
+}
+
+konto_entropy <- function(msg, return = c("r", "h")) {
+  
+  return <- match.arg(return)
+  
+  msg <- msg[!is.na(msg)]
+  if (length(msg) < 5) return(NA_real_)
+  
+  if (length(msg) > 1) {
+    msg <- paste(msg,collapse = "")
+  }
+  
+  N <- nchar(msg)
+  if (N < 2) return(NA_real_)
+  
+  sum_val <- 0
+  num <- 0
+  
+  for (i in 1:floor(N / 2)) {
+    
+    res <- matchLength(msg, i, i)
+    l <- res$l
+    
+    if (l <= 0) next
+      
+    sum_val <- sum_val + log2(i + 1) / l
+    num <- num + 1
+    
+  }
+  
+  if (num == 0) return(NA_real_)
+  
+  h <- sum_val / num # entropy
+  r <- 1 - h / log2(N) # normalized entropy
+  
+  if (return == "h") return(h)
+  return(r)
+}
+
+roll_z <- function(x, window) {
+  roll_sd <- zoo::rollapply(x, width = window, FUN = sd, fill = NA, align = "right", na.rm = T)
+  roll_mean <- zoo::rollapply(x, width = window, FUN = mean, fill = NA, align = "right", na.rm = T)
+  z <- (x - roll_mean) / roll_sd
+  z[roll_sd ==0] <- NA_real_
+  return(z)
 }
