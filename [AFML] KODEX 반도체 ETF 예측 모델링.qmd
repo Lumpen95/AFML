@@ -1,0 +1,1278 @@
+---
+title: "AFML 기반 ETF 수익률 분류 실험: KODEX 반도체"
+author: "lumpen95"
+format: 
+  html:
+    toc: true
+    code-fold: true
+    theme: slate
+    css: style.css
+    code-links: 
+      - text: "GitHub (source code)"
+        icon: github
+        href: ""
+---
+
+# 개요
+
+본 프로젝트는 **Marcos Lopez de Perado**의 [*Advances in Financial Machine Learning(AFML)*](https://product.kyobobook.co.kr/detail/S000003114165) 프레임워크를 개인 투자 환경에 적용해, **KODEX 반도체 ETF의 단기 수익률 방향(상승/하락)을 예측하는 분류기**를 구축하는 것을 목표로 했다. 단순한 가격 기반 규칙(이동평균 교차, RSI 과매수/과매도)에 의존하는 대신, AFML이 제시하는 **이벤트 기반 표본 추출, 표본 중복에 따른 편향 통제(Purged/Embargo), 메타라벨링 관점의 베팅 문제 정의, 정보 누수 방지 및 검증 체계**를 중심으로 "백테스트에서만 좋아 보이는 전략"을 최대한 배제하고자 했다.
+
+구현 과정에서는 일별 데이터로부터 이벤트를 정의하고(CUSUM 필터 등), 이벤트별 특성(기술적 지표, 수급/거시 변수의 변환값, 엔트로피 기반 지표 등)을 설계한 뒤, 가중치 및 교차검증 절차를 포함한 학습 파이프라인을 구축했다. 또한, 모델 성능 평가지표로는 정확도보다 확률 예측의 품질을 반영하는 Log Loss를 중심에 두고, 특성 중요도(MDI/MDA/SFI)를 통해 유의미한 예측 정보를 담은 특징이 실제로 존재하는지를 검증했다.
+
+결론적으로, 현재까지의 실험에서는 **일별 데이터 기반에서 안정적으로 재현 가능한 유의미한 특성을 확인하지 못했으며**, 모델 성과가 반복 실험과 구간 변화에 따라 쉽게 흔들리는 한계를 확인했다. 특히 **ETF/지수형 상품의 단기 방향 예측에서 미시구조(체결/호가/거래 강도) 정보가 희박한 데일리 타임바를 사용함으로써 이벤트 정의와 특징 설계의 해상도가 낮아진다는 점이** 주요 실패 원인으로 작용했다.
+
+이에 따라 프로젝트는 즉시 실전 적용 가능한 예측기 단계까지는 진행하지 못했지만, AFML 핵심 개념을 실제 데이터로 구현 및 검증한 전 과정과 실패 원인 분석 자체가 큰 산출물이 되었다. 즉, 성과가 나온 전략 소개가 아니라 **현실적인 제약 속에서 AFML을 적용해 본 실험 보고서이자, 나의 머신러닝 기반 투자 연구 포트폴리오 구축의 시발점**이다.
+
+# 본론
+
+## 1. 문제 정의
+
+본 프로젝트의 목표는 **KODEX 반도체 ETF(091160)의 단기 수익 기회를 '분류 문제'로 정의**하고, AFML 프레임워크(이벤트 기반 샘플링, 라벨링, 정보 누수 방지 검증)를 통해 재현 가능한 예측 신호(특성)가 존재하는지 검증하는 것이다. 단순히 "다음 날 수익률"을 예측하는 대신, 거래 의사결정의 단위를 이벤트(event)로 정의하여 표본을 구성하고, 이벤트 발생 시점($t_0$)에서 향후 일정 구간($t_1$) 동안의 결과를 라벨링 하는 방식으로 접근한다.
+
+### 1.1 예측 대상(Target)
+
+-   기본적으로 가격 시계열은 일별 종가 기반으로 구성하며, 로그수익률을 사용한다.
+
+$$
+r_t = \text{log}(P_t) - \text{log}(P_{t-1})
+$$
+
+-   단기 방향성 예측을 위해 5영업일 누적 수익률을 미래 수익으로 정의한다.
+
+$$
+r_{t \to t+5}^{(5)} = \sum_{i=1}^{5} r_{t+i}
+$$
+
+-   변동성 스케일을 고려하기 위해 **20일 변동성(표준편차)**을 사용하고, **'미래 5일 수익 / 현재 변동성'이 양수**인지로 1차 방향 레이블을 만들었다.
+
+$$
+\text{side}_t = 1(\frac{r_{t \to t+5}^{(5)}}{\sigma_{t,20}}>0)
+$$
+
+### 1.2 2단계 구조: 방향 모델 -\> 메타라벨링
+
+AFML의 핵심 아이디어를 따라 **(1) 방향성(베팅 방향) 모델**을 먼저 구축하고, 이후 (2) 메타라벨(bin)을 통해 "그 방향 베팅을 실행할지 말지"를 학습힌다.
+
+-   1차 모델은 시장에 참여 가능한(tradable) 구간에서만 학습하고, 그 외 구간은 보수적으로 `side = 0`으로 둔다.
+-   2차 모델(메타라벨링)은 이벤트별로 **"해당 방향 베팅이 유효했는가"**를 라벨로 만들어 분류한다.
+
+### 1.3 Tradable Regime Gate (거래 가능 구간)
+
+외생 변수 기반 상태(state)로 **거래 가능 구간(gate)**을 정의했다.
+
+규칙은 다음과 같다.
+
+-   ISM 제조업 PMI가 50 이상(확장 국면)
+-   외국인 20일 누적 순매수가 양수(수급 우호)
+
+즉, 아래 조건을 만족하는 날을 **tradable**로 간주한다.
+
+-   `tradable = state_PMI & state_Foreign_flow`
+
+이는 **"전 구간에서 일관된 예측"보다, 구조적으로 예측 가능성이 있는 구간에서만 학습**하는 접근이며, 뒤에 등장하는 이벤트 샘플링과 결합된다.
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(
+  message = F, 
+  warning = F,
+  fig.height = 7,
+  eval = F
+)
+```
+
+```{r}
+#| label: load package
+#| eval: true
+
+## 패키지 로드
+library(tseries)
+library(tidyverse)
+library(quantmod)
+library(tidyquant)
+library(tsfeatures)
+library(tidymodels)
+library(hardhat)
+library(tsfeatures)
+library(readr)
+library(PerformanceAnalytics)
+library(highcharter)
+library(gt)
+library(future)
+library(future.apply)
+library(furrr)
+library(TSEntropies)
+```
+
+```{r}
+#| label: load data
+#| eval: true
+
+## 깃허브 주소
+addr <- "https://raw.githubusercontent.com/Lumpen95/"
+## AFML 함수 호출
+source(paste0(addr, "AFML/main/AFML_Func.R"))
+source(paste0(addr, "Quantamental_Lab/main/Func.R"))
+
+## 전략 실행일
+start_date <- "2007-01-29"
+end_date <- "2025-12-31"
+
+semicon_etf <- read_csv(paste0(addr, "AFML/main/data/semicon_etf.csv"))
+```
+
+### 대상 ETF 개요
+
+-   ETF명: KODEX 반도체 ETF(091160)
+-   전략 기간: 2007.01.29 \~ 2025.12.31
+
+```{r}
+#| echo: false
+#| eval: true
+
+## 차트
+etf.xts <- xts(semicon_etf |> select(-Index), order.by = semicon_etf$Index)
+hc_stock_basic(etf.xts, "KODEX 반도체 ETF", "Period: 2007-01-29 ~ 2025-12-31")
+```
+
+## 2. 이벤트 정의 및 표본 추출(Event Sampling)
+
+AFML에서는 최종 학습에 사용하게 될 이벤트 생성을 위해 이벤트 발생 시점($t_0$)과 향후 일정 시점($t_1$)까지의 일련의 수익률 경로를 사용한다. 이렇게 되면 특정 시점에 이벤트가 몰리게 되면 라벨을 생성하기 위해 사용된 수익률들이 겹치게 된다.
+
+즉, 일별 데이터에서 모든 날짜를 표본으로 사용하면 (i) 표본 간 중복이 심하고, (ii) 정보가 빈약한 구간까지 학습에 포함되며, (iii) 검증 시 누수 위험이 커진다. 따라서 본 프로젝트는 AFML에서 제안하는 방식대로 **이벤트 기반 표본 추출**을 수행했다. 이벤트는 **"가격 변동이 의미 있게 발생한 시점"이면서, 동시에 "구조적 붕괴 및 고엔트로피(저예측성) 구간을 회피하는 시점"**으로 정의한다.
+
+### 2.1 변동성 기반 대칭 CUSUM 필터
+
+우선 로그수익률에 대해 **EWMA 변동성(span = 50)**을 계산하고, 이를 임계치로 사용하는 대칭 CUSUM 필터로 후보 이벤트 시점을 추출한다.
+
+CUSUM 필터란 품질 통제 기법의 일종으로 **국지적 정상성(locally stationary process)를 가정한 IID 관측값인 로그 수익률의 누적 수익률이 일정 임계치를 넘는 경우 이벤트 시점**으로 간주한다. 즉, 누적된 작은 변화를 감지해 이벤트를 만들며, 단순 절대수익률 필터보다 구조적인 변화를 더 잘 포착할 수 있다.
+
+-   일별 변동성 추정: `rolling_sd = ewmsd(log_ret, span = 50)`
+-   CUSUM 임계치: `h_t = 1.96 * rolling_sd` (정규 가정 하 95% 수준의 변동성 스케일)
+- 관련 함수
+  - `ewma`: 지수가중 이동평균
+  - `ewmsd`: 지수가중 이동표준편차
+  - `sym_cusum`: 대칭 CUSUM 필터
+
+### 2.2 구조적 붕괴 구간 제거 필터: CSW
+
+대칭 CUSUM 필터를 통해 학습에 사용할 1차적인 이벤트 시점($t_0$)을 추출했다. 추가적으로 추출된 시점이 만약에 **구조적 변환이 급격히 발생한 구간이라면 학습에서 제외**해야 한다. 이를 위해 [홈과 브라이퉁(Homm and Breitung, 2012)](https://academic.oup.com/jfec/article-abstract/10/1/198/757787?redirectedFrom=fulltext#13303475)의 논문에 등장하는 **추-스틴치콤-화이트(CSW) CUSUM**방식을 적용한다.
+
+CSW 통계량은 **기준 시점 n의** $y_n(t>n)$과 로그 수익률 $y_t$의 표준화된 이격으로 정의된다. 기준 시점 n을 순환하며 매 시점 CSW 통계량을 계산하고, 통계량 절대값이 매우 큰 구간을 붕괴 구간으로 간주하여 제외했다.
+
+-   `csw_stat = computeCSW(log_ret)`
+-   CSW 임계치: `csw_threshold = quantile(|csw_stat|, 0.99)` (상위 1% 수준의 극단적 구조 변화 구간을 "불안정 구간"으로 간주)
+
+최종적으로 대칭 CUSUM 이벤트 후보 중에서, CSW 기준을 통과한 시점만 남긴다.
+
+- 관련 함수
+  - `computeCSW`: CSW 통계량 계산
+
+### 2.3 예측 가능성 필터: 수익률 부호 기반 Konto 엔트로피
+
+춰가적으로 "정보량이 낮아 예측이 어려운 구간(고엔트로피)"을 회피하기 위해, 일별 수익률 부호 시퀀스에 대해 엔트로피를 계산한다. 엔트로피 계산은 콘토이야니스의 렘펠 지브 엔트로피 계산을 개선한 [가오의 논문(Yun Gao, 2008)](https://www.dam.brown.edu/people/elie/papers/Gao%20Kontoyiannis%20Bienenstock%20Estimating%20the%20entropy%20of%20binary%20time%20series.pdf) 방식을 따른다.
+
+-   수익률 부호: `log_ret_sym = 1{log_ret>0}`
+-   엔트로피: `log_ret_konto_entropy = zoo::rollapply(log_ret_sym, width = 20, FUN = konto_entropy)`
+-   저엔트로피(규칙성 및 예측가능성이 높음) 구간만 채택:
+    -   `entropy_threshold = quantile(entropy, 0.4)`
+    -   `entropy-idx = entropy < entropy_threshold`
+
+즉, 엔트로피가 낮은(더 규칙적일 가능성이 있는) 구간의 이벤트만 최종 표본으로 사용한다.
+
+- 관련 함수
+  - `matchLength`: 가장 긴 매치 길이 계산
+  - `konto_entropy`
+
+### 2.4 최종 이벤트 집합
+
+최종 이벤트 시점은 아래 3개 필터의 교집합으로 정의된다.
+
+1.  대칭 CUSUM 이벤트 시점
+2.  CSW 구조적 붕괴 구간 제외
+3.  Konto 엔트로피 하위 40% 구간
+
+$$
+\mathcal{E} 
+= 
+\mathcal{E}_{\mathrm{CUSUM}}
+\cap
+\mathcal{E}_{\mathrm{CSW\text{-}valid}}
+\cap
+\mathcal{E}_{\mathrm{low\text{-}entropy}}
+$$
+
+이 과정을 통해 일별 전체 관측치를 학습에 쓰는 대신, **정보가 상대적으로 풍부하고, 불안정 레짐을 피하며, 예측 가능성이 더 높을 수 있는 구간에 집중한 이벤트 표본**을 구성했다.
+
+## 3. 이벤트 라벨링 개요 (t0 -\> t1, triple barrier 구조)
+
+표본추출된 이벤트 시점($t_0$)에 대한 라벨링을 위해 AFML은 **삼중 배리어(triple barrier)** 기법을 제안한다. 이는 세 가지 배리어 중 최초로 도달한 배리어에 따라 관측값을 레이블하기 때문으로 일반적으로 **2개의 수평 배리어와 1개의 수직 배리어**를 설정한다.
+
+-   상단 배리어에 먼저 도달 시 : 1
+-   하단 배리어에 먼저 도달 시 : -1
+-   수직 배리어에 먼저 도달 시 : 0
+
+각 이벤트에 대해
+
+-   이벤트 시작 시점 $t_0$
+-   수직 배리어 $t_1 = t_0$ + 10 영업일(최대 보유 기간)
+-   타겟 변동성 $trgt = \sigma_{t0,EWMA}$
+-   1차 모델이 제공한 방향 $side \in \{0, 1\}$
+
+을 정의하고, triple barrier(PT/SL + vertical barrier) 규칙으로 메타라벨 `bin`을 생성한다.
+
+-   **이익(Profit Taking, PT)**: +1.5 $\times ~ trgt$
+-   **손절(Stop Loss, SL)**: -1.0 $\times ~ trgt$
+-   먼저 닿는 장벽에 따라 `bin`을 부여(유효한 베팅이면 1, 아니면 0)
+
+이렇게 만든 `bin`을 최종 분류 타깃으로 하여, "방향은 이미 주어졌을 때, 그 베팅을 실행할 가치가 있었는가?"를 학습하는 메타라벨링 문제로 정의한다.
+
+## 4. 특징 설계: 내성(Endogenous) vs 외생(Exogenous)
+
+특징(feature)은 크게 내생 변수(ETF 자체 가격 및 거래량에서 파생)와 외생 변수(거시/수급/환율/해외지수 등 외부 요인)로 구성된다. 또한 외생 변수 중 일부는 예측 신호가 아니라 거래 가능 구간을 정의하는 regime gate로 사용한다. 즉, 동일한 외생 변수라도 목적에 따라
+
+-   `state_*`: 시장 상태/레짐을 나타내는 이진 상태 변수
+-   `feat_exo_*`: 학습에 투입되는 외생 특징(연속형/거리형)
+-   `feat_endo_*`: 학습에 투입되는 내생 특징
+
+으로 역할을 분리하였다.
+
+### 4.1 설계 원칙
+
+1.  **예측(signal)과 조건(gate)의 분리**
+
+    예측력이 있다고 기대되는 변수를 무조건 모델 입력으로 넣기보다, 일부는 "언제 거래할지"를 결정하는 조건부 필터로 사용한다. 이는 일별 데이터에서 신호가 약할 때, 잡음을 줄이고 구조적으로 유리한 구간에서만 학습하도록 유도한다.
+
+2.  **빈도**$\cdot$지연(lag)$\cdot$정렬(alignment) 일관성
+
+    외생 변수는 월별/일별 등 빈도가 달라서, 일별 ETF 데이터에 병합할 때 **과거 값 유지(locf)** 방식으로 정렬했다. 월별 지표는 실무적으로 발표 지연이 존재하므로, 실험에서는 보수적으로 "해당 월 값이 당월에 바로 사용 가능"하다고 가정하지 않도록 설계했고, 최소한 `na.locf`로 "미래 정보를 끌어오지 않게" 정렬하는 것으로 **사전관찰(look-ahead)을 방지**했다.
+
+3.  **스케일 정규화 및 '거리형' 특징**
+
+    단순 RSI 값 자체보다 `abs(RSI - 50)`으로 **중립(50)으로부터의 거리**를 사용해, "방향성"보다는 "추세/쏠림 강도"를 반영하도록 했다. 월별/일별 시계열에도 `roll_z()`으로 상대적 상태(state)를 구성했다.
+
+### 4.2 외생 변수 특징(Exogenous Features)
+
+외생 변수는 크게 거시 regime, 국내 수급, 글로벌 반도체 사이클(해외 지수), 환율로 구성했다.
+
+1.  ISM 제조업 PMI (Monthly)
+
+-   목적: 경기 확장/수축 국면을 단순 상태로 반영
+-   생성:
+    -   `state_PMI = (PMI >= 50)`
+-   활용: tradable gate의 핵심 조건
+-   출처: [인베스팅 닷컴](https://kr.investing.com/economic-calendar/ism-manufacturing-pmi-173)
+
+```{r}
+### 1. ISM 제조업 PMI
+## freq: monthly
+## lag: 1
+ism_pmi <- read_csv(paste0(addr, "AFML/main/data/ism_pmi.csv"))
+ism_pmi <- ism_pmi |> 
+  mutate(
+    state_PMI = Value >= 50
+  ) |> 
+  dplyr::select(Index, starts_with("state")) |> 
+  na.omit()
+```
+
+2.  반도체 수출물가지수 (Monthly)
+
+-   목적: 업황(사이클) 변화를 "추세/상대 강도"로 반영
+-   생성:
+    -   `export_yoy = 100 * (log(Value) - log(lag(Value,12)))`
+    -   `export_yoy_z = roll_z(export_yoy, window=24)`
+    -   `state_export_yoy = (export_yoy_z > 0)`
+-   활용: 게이트 또는 보조 상태 변수
+-   출처: [한국은행 경제통계시스템](https://ecos.bok.or.kr/)
+
+```{r}
+### 2. 반도체 수출물가지수
+## freq: monthly
+## lag: 1
+export_index <- read_csv(paste0(addr, "AFML/main/data/export_semi_price_index.csv"))
+export_index <- export_index |> 
+  mutate(
+    export_yoy = 100 * (log(Value) - log(lag(Value, 12))),
+    export_yoy_z = roll_z(export_yoy, window = 24),
+    state_export_yoy = export_yoy_z > 0
+  ) |> 
+  dplyr::select(Index, starts_with("state")) |> 
+  na.omit()
+```
+
+3.  투자자 예탁금 (Daily)
+
+-   목적: 유동성/리스크 선호의 단기 변화 반영
+-   생성:
+    -   `deposit_z = roll_z(Value, window=60)`
+    -   `state_deposit = (deposit_z > 0)`
+    -   `deposit_chg = log(Value) - log(lag(Value,1))`
+    -   `deposit_chg_z = roll_z(deposit_chg, window=30)`
+    -   `feat_exo_D_deposit_chg = (deposit_chg_z > 0)`
+-   특징: 절대 수준보다 변화율/상대 강도 중심으로 설계
+-   출처: [한국거래소 경제통계시스템](https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd)
+
+```{r}
+### 3. 투자자 예탁금
+## freq: daily
+deposit <- read_csv(paste0(addr, "AFML/main/data/deposit.csv"))
+deposit <- deposit |> 
+  mutate(
+    deposit_z = roll_z(Value, window = 60),
+    state_deposit = deposit_z > 0,
+    deposit_chg = log(Value) - log(lag(Value, 1)),
+    deposit_chg_z = roll_z(deposit_chg, window = 30),
+    feat_exo_D_deposit_chg = deposit_chg_z > 0
+  ) |> 
+  dplyr::select(Index, starts_with(c("state", "feat"))) |> 
+  na.omit()
+```
+
+4.  기관/외국인/개인 순매수 (Daily)
+
+-   목적: 수급 주체별 흐름(Flow)과 쏠림(Trendiness) 측정
+-   생성:
+    -   누적 흐름(20일):
+        -   `institutional_cum20`
+        -   `foreign_cum20`
+    -   상태 변수:
+        -   `state_institutional_flow = (institutional_cum20 > 0)`
+        -   `state_Foreign_flow = (foreign_cum20 > 0)`
+    -   RSI-중립 거리:
+        -   `feat_exo_D_institutional_rsi_50 = abs(RSI(Institutional,14) - 50)`
+        -   `feat_exo_D_foreign_rsi_50 = abs(RSI(Foreign,14) - 50)`
+        -   `feat_exo_D_retail_rsi_50 = abs(RSI(Retail,14) - 50)`
+-   출처: [한국거래소 경제통계시스템](https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd)
+
+```{r}
+### 4. 기관/외국인/개인 순매수
+## freq: daily
+net_long <- read_csv(paste0(addr, "AFML/main/data/net_long.csv"))
+net_long <- net_long |> 
+  mutate(
+    institutional_cum20 = zoo::rollsum(Institutional_Total, 20, fill = NA, align = "right"),
+    foreign_cum20 = zoo::rollsum(Foreign_Total, 20, fill = NA, align = "right"),
+    state_institutional_flow = institutional_cum20 > 0,
+    state_Foreign_flow = foreign_cum20 > 0,
+    
+    feat_exo_D_institutional_rsi_50 = abs(TTR::RSI(Institutional_Total, n = 14) - 50),
+    feat_exo_D_foreign_rsi_50 = abs(TTR::RSI(Foreign_Total, n = 14) - 50),
+    feat_exo_D_retail_rsi_50 = abs(TTR::RSI(Retail_Total, n = 14) - 50)
+  ) |> 
+  dplyr::select(Index, starts_with(c("state", "feat"))) |> 
+  na.omit()
+```
+
+5.  필라델피아 반도체 지수(SOX, Daily)
+
+-   목적: 국내 ETF와 유사한 글로벌 반도체 사이클의 강도 반영
+-   생성:
+    -   `feat_exo_D_sox_rsi_50 = abs(RSI(SOX,15) - 50)`
+
+```{r}
+### 5. 필라델피아 반도체 지수
+## freq: daily
+SOX <- getSymbols("^SOX", from = start_date, to = end_date, auto.assign = F)
+SOX <- SOX |> 
+  Ad() |> 
+  na.locf() |> 
+  fortify.zoo() |> 
+  as_tibble() |> 
+  mutate(
+    feat_exo_D_sox_rsi_50 = abs(TTR::RSI(SOX.Adjusted, n = 15) - 50)
+  ) |> 
+  dplyr::select(Index, starts_with("feat")) |> 
+  na.omit()
+```
+
+6.  USDKRW 환율 (Daily)
+
+-   목적: 외국인 수급 및 위험선호에 영향을 주는 환율 요인
+-   생성:
+    -   `feat_exo_D_usdkrw_rsi_50 = abs(RSI(USDKRW,14) - 50)`
+
+```{r}
+### 6. USDKRW
+## freq: daily
+usdkrw <- read_csv(paste0(addr, "AFML/main/data/usdkrw.csv"))
+usdkrw <- usdkrw |> 
+  mutate(
+    feat_exo_D_usdkrw_rsi_50 = abs(TTR::RSI(Value, n = 14) - 50)
+  ) |> 
+  dplyr::select(Index, starts_with("feat")) |> 
+  na.omit()
+```
+
+### 4.3 내생 변수 특징(Endogenous Features)
+
+내생 특징은 ETF의 가격$\cdot$수익률$\cdot$거래량으로부터 생성하며, 크게 추세/모멘텀, 정상성/기억성, 미시적 대체 지표(거래량 기반), 시계열 요약 특징(tsfeatures)로 구성했다.
+
+1.  1차 방향 모델용(Trend/Momentum 중심)
+
+-   단기$\cdot$중기 추세:
+    -   `side_trend_5d = rollsum(log_ret, 5)`
+    -   `side_trend_20d = rollsum(log_ret, 20)`
+-   EMA 거리(정규화):
+    -   `ema20 = EMA(log_price, 20)`
+    -   `side_ema20_dist = (log_price - ema20) / sd(|log_ret|,20)`
+-   추세 정렬/강도:
+    -   `side_trend_alignment = side_trend_5d * (log_price - ema20)`
+    -   `side_trend_ratio = side_trend_5d / side_trend_20d`
+
+이 1차 모델은 tradable 구간에서만 학습해, "해당 구간에서의 방향성"을 확률로 산출한다.
+
+2.  2차 메타라벨링 모델용(정보성/요약특징 중심)
+
+-   **분수차분(FFD)** 기반 특징
+    -   목적: 가격 수준의 **기억성(장기 의존)**을 일부 유지하면서 **정상성**을 확보
+    -   1차 차분 시 정상성을 확보할 수 있지만 기억성을 완전히 잃어버린다.
+    -   이에 따라 AFML에서는 **0과 1 사이 최적의 차분계수**를 탐색해 분수미분 특징을 사용한다.
+    -   절차:
+        -   여러 d 후보에 대해 ADF p-value 와 원시 로그 가격과의 상관을 비교
+        -   최종적으로 `d = 0.1` 선택
+    -   생성:
+        -   `feat_endo_ffd = fracdiff_ffd(log_price, d=0.1)`
+- 관련 함수
+  - `getWeights_ffd`
+  - `fracdiff_ffd`
+
+```{r}
+#| eval: true
+
+### 분수미분을 위한 최적 차분 계수 d 탐색
+close_ts <- semicon_etf$Close
+
+d_grid <- tibble(d=seq(0,1,0.1)) |> 
+  mutate(stats= map(d, function(d) {
+    ffd <- fracdiff_ffd(log(close_ts),d, thres = 1e-4)
+    p <- adf.test(na.omit(ffd))$p.value
+    
+    cor_mat <- cbind(log(close_ts),ffd) |> na.omit() |> cor()
+    return(list(p=p,cor=cor_mat[2,1]))
+  }))
+
+d_grid |> 
+  unnest_wider(stats) |> 
+  gt() |> 
+  fmt_number(columns = c(d, p, cor), decimals = 4) |> 
+  cols_label(
+    d = "d",
+    p = "p-value",
+    cor = "Correlation"
+  ) |> 
+  tab_header(title = "Grid Search Results") |> 
+  tab_options(
+    table.width = pct(60),
+    table.background.color = "#1E1E1E",
+    table.font.color = "#E6E6E6",
+    heading.background.color = "#1E1E1E",
+    heading.title.font.size = px(16)
+  )
+```
+
+-   d = 0.1 일 경우 정상성을 확보하면서 상관관계 역시 0.9894로 기억성을 거의 보존하고 있다.
+
+```{r}
+#| include: false
+d <- 0.1
+```
+
+-   거래량 기반 MFI
+    -   목적: 일별 데이터에서 미시 구조를 직접 관측하지 못하므로, 거래량$\cdot$가격대를 결합한 대체 미시지표로 MFI 사용
+    -   생성:
+        -   `feat_endo_MFI = MFI(HLC, Volume)`
+-   수익률 부호 엔트로피(Konto Entropy)
+    -   목적: 예측 가능성이 낮은 구간을 이벤트 단계에서 걸러내기 위해 사용
+    -   생성:
+        -   `log_ret_sym = 1{log_ret>0}`
+        -   `log_ret_konto_entropy = rollapply(log_ret_sym, 20, konto_entropy)`
+-   tsfeatures 기반 요약 특징
+    -   목적: 이벤트 시점(t0) 이전 20일 간 가격 시계열을 다양한 관점에서 요약해 국면 특성을 압축
+    -   생성 방식:
+        -   20일 슬라이딩 윈도우(`.before = 19`)로 가격 시퀀스를 만들고
+        -   `tsfeatures` 패키지를 사용해 아래 특징을 계산
+            -   `acf_features`: 자기상관 구조
+            -   `stability`, `lumpiness`: 변동성 구조
+            -   `entropy`: 불확실성
+            -   `hurst`: 장기 의존/추세성
+    -   결과 칼럼은 `feat_endo_*`형태로 unnest하여 모델 입력으로 사용
+
+### 4.4 "state" vs "feat" 역할 정리
+
+-   `state_*`: 레짐 판단/거래 여부 판단
+-   `feat_exo_*`: 외생 입력 특징
+-   `feat_endo_*`: 내생 입력 특징
+
+특히 `tradable`은 학습 데이터 구성에 직접 영향을 미치는 중요한 설계로, "전 구간 예측"이 아니라 "거래 가능한 국면에서만 예측"하도록 표본과 학습 목적을 제한한다. 이는 일별 데이터 기반에서 발생하기 쉬운 잡음을 줄이려는 시도이며, 이후 이벤트 샘플링(CUSUM/CSW/Entropy)과 결합되어 최종 이벤트 데이터셋을 구성한다.
+
+## 5. 모델 설계
+
+AFML의 핵심인 정보 누수 방지와 표본 중복 편향 통제를 위해 일반적인 랜덤 K-fold 대신 Purged K-fold 와 Embargo 그리고 고유도 기반 가중치(avg uniqueness)를 중점적으로 사용하여 설계한다.
+
+### 5.1 랜덤 포레스트
+
+AFML에서는 부스팅 기법보다 배깅 기법인 **랜덤 포레스트(Random Forest, RF)를 선호**한다. 금융 시계열은 노이즈가 크고 비정상적이며, 라벨도 불완전해 **과최적화에 취약**하기 때문이다. 이런 환경에서 RF는 다음 특성에서 유리하다.
+
+1.  노이즈에 대한 강건성
+
+-   RF는 부트스트랩 + 배깅으로 **분산**[^오류]을 줄이는 데 효과적이다.
+-   금융 데이터처럼 신호 대 잡음 비율이 낮을 수록, 한 번의 강한 적합보다 **평균화에 의한 안정성**이 중요하다.
+
+[^오류]: 머신러닝 모델에는 크게 3가지 오류가 존재한다. \
+    \
+    편향(bias): 비현실적인 가정에서 비롯되며 모델이 시장을 너무 단순하게 보는 오류이다. 알고리즘이 과소적합(underfit)된 경우를 의미한다.\
+    \
+    분산(variance): 훈련 데이터의 작은 변화에 대한 민감도를 의미하며 분산이 높으면 알고리즘이 과대적합(overfit)한 것이다. 우연을 믿은 대가이다.\
+    \
+    잡음(noise): 예측하지 못한 변화나 측정 오류와 같은 관측값의 분산 때문에 발생한다. 더 이상 줄일 수 없는 오류이므로 어떤 모델로도 해결할 수 없다.
+
+2.  비교적 낮은 과최적화 리스크
+
+-   부스팅은 이전 오류를 집요하게 보정하면서 학습하므로, 미세한 패턴까지 따라가려는 경향이 있다.
+-   RF는 각 트리가 독립적으로 학습되고 평균화되므로, 과최적합을 완충하는 구조를 가진다.
+
+3.  낮은 하이퍼파라미터 민감도
+
+-   부스팅 기법 대비 RF는 적은 핵심 파라미터만으로도 충분한 성능을 발휘한다.
+
+4.  특성 중요도 연구에 적합
+
+- RF는 AMFL에서 강조하는 MDI/MDA/SFI(뒤에 설명) 같은 중요도 분석을 적용하기 쉽다.
+- 특히 MDA는 모델 종류와 무관하지만, RF는 기본적으로 비선형/상호작용을 포함하면서 평균 안정성을 갖기에 중요도 실험을 반복하기 적합하다.
+
+### 5.2 데이터셋 구성 요약
+
+전체 일별 관측에서 다음 단계로 학습 표본을 구성한다.
+
+#### 1. 일별 데이터 병합 및 정렬
+
+-   내생 변수와 외생 변수를 날짜(Index) 기준으로 병합하고, 외생 변수는 `na.locf()`로 이전 값을 유지하여 정렬한다.
+-   앞서 정의한 변수를 포함한 테이블을 생성한다.
+
+```{r}
+### 병합 테이블 리스트 생성
+ex_feat_list <- list(
+  ism_pmi,
+  export_index,
+  deposit,
+  net_long,
+  SOX,
+  usdkrw
+)
+
+### 특징 테이블 생성
+feat_tbl <- reduce(ex_feat_list, .init = semicon_etf, function(acc, df) {
+  full_join(acc, df, by = join_by("Index")) |> 
+    arrange(Index) |> 
+    mutate(
+      across(
+        starts_with(c("feat", "state")), ~zoo::na.locf(.x, na.rm = F)
+      )
+    ) |> 
+    na.omit()
+})
+
+### 병렬 처리용
+plan(multisession, workers = 8)
+
+### 특징 테이블 생성2
+feat_tbl <- feat_tbl |> 
+  mutate(
+    tradable = 
+      state_PMI &
+      state_Foreign_flow,
+    
+    ## 1차 방향 라벨 생성 - side
+    log_price = log(Close),
+    log_ret = log_price - dplyr::lag(log_price, n = 1),
+    ret_fwd_5d = zoo::rollapply(log_ret, 5, sum, align = "left", fill = NA),
+    vol_20d = zoo::rollapply(log_ret, 20, sd, align = "right", fill = NA),
+    
+    side = as.factor(dplyr::if_else(ret_fwd_5d / vol_20d > 0, 1, 0)),
+    
+    ## 1차 방향 모델 특징 정의
+    side_trend_5d = zoo::rollapply(log_ret, width = 5, FUN = sum, align = "right", fill = NA),
+    side_trend_20d = zoo::rollapply(log_ret, width = 20, FUN = sum, align = "right", fill = NA),
+    ema20 = TTR::EMA(log_price, n = 20),
+    side_ema20_dist = (log_price - ema20) / zoo::rollapply(abs(log_ret), 
+                                                           width = 20, 
+                                                           FUN = sd, 
+                                                           fill = NA, 
+                                                           align = "right"),
+    side_trend_alignment = side_trend_5d * (log_price - ema20),
+    side_trend_ratio = side_trend_5d / side_trend_20d,
+    
+    ## 이벤트 필터용 entropy 특징 생성
+    log_ret_sym = if_else(log_ret > 0, 1, 0),
+    log_ret_konto_entropy = zoo::rollapply(log_ret_sym, 
+                                           width = 20, 
+                                           FUN = konto_entropy, 
+                                           align = "right", 
+                                           fill = NA),
+    ## 2차 모델 특징 정의
+    feat_endo_ffd=fracdiff_ffd(log_price,d=d,thres=1e-4),
+    feat_endo_MFI=TTR::MFI(cbind(High,Low,Close),Volume),
+    
+    tsf = slider::slide(
+      .x = Close,
+      .before = 19,
+      .complete = TRUE,
+      .f = ~ list(.x)
+    ),
+    feat = furrr::future_map(
+      tsf,
+      ~ tryCatch(
+        {
+          tsfeatures(
+            .x,
+            features = c("acf_features", "stability", "lumpiness", "entropy", "hurst")
+          )
+        }, error = function(e) {
+          NULL
+        }
+      )
+    )
+  ) |> 
+  tidyr::unnest(feat, keep_empty = TRUE, names_sep = "_endo_") |> 
+  na.omit()
+
+### 병렬 처리 종료
+plan(sequential)
+```
+
+#### 2. Tradable Regime Gate 적용
+
+-   경기/수급 상태(`state_*`) 기반으로 `tradable`구간을 정의하고, 1차 방향 모델은 tradable 구간에서만 학습한다.
+-   이를 통해 구조적으로 불리하거나 노이즈가 큰 구간에서 학습되는 것을 완화한다.
+
+```{r}
+### 1차 방향 모델 테이블 생성
+side_tbl <- feat_tbl |> 
+  select(starts_with("side"))
+
+### 1차 방향 훈련 데이터셋 - only tradable
+side_train_tbl <- feat_tbl |> 
+  filter(tradable) |> 
+  select(starts_with("side"))
+
+### 1차 방향 모델 학습
+fit_side <- ranger::ranger(
+  side ~.,
+  data = side_train_tbl,
+  num.trees = 1000,
+  mtry = 1,
+  probability = T,
+  importance = "none"
+)
+
+### 1차 방향성 모델에 의해서 side 정의
+side_pred <- predict(fit_side, data = side_tbl)$predictions[, "1"]
+
+final_feat_tbl <- feat_tbl |> 
+  mutate(
+    # tradable이 아닌 경우 방향 0 강제
+    side = if_else(
+      tradable,
+      side_pred,
+      0
+    )
+  ) |> 
+  select(Index, side, log_ret, log_ret_konto_entropy ,starts_with("feat"))
+
+final_feat_tbl <- final_feat_tbl |> 
+  mutate(side = if_else(side > 0.5, 1, 0))
+```
+
+#### 3. 이벤트 기반 샘플링(Event Sampling)
+
+-   **대칭 CUSUM 후보 -\> CSW 구조적 붕괴 구간 제거 -\> 저엔트로피(Konto) 구간 필터**를 거쳐 최종 이벤트 시점 `final_events_idx`를 확정한다.
+
+```{r}
+## 이벤트 표본 추출
+
+# 1. 대칭 CUSUM
+# 일일 변동성을 임계치로 사용
+rolling_sd <- ewmsd(final_feat_tbl$log_ret, span = 50)
+sym_cusum_idx <- sym_cusum(final_feat_tbl$log_ret, h = rolling_sd * 1.96)
+
+# 2. CSW CUSUM
+# 구조적 붕괴 구간 제외
+csw_stat <- computeCSW(final_feat_tbl$log_ret)
+csw_threshhold <- quantile(abs(csw_stat), 0.99, na.rm = TRUE)
+
+csw_valid_idx <- validate_sym(sym_cusum_idx, csw_stat, csw_threshhold)
+
+# 3. Entropy
+# 예측 가능 여부 확인
+entropy_threshold <- quantile(final_feat_tbl$log_ret_konto_entropy, 0.4, na.rm = T)
+entropy_idx <- which(final_feat_tbl$log_ret_konto_entropy < entropy_threshold)
+
+final_events_idx <- intersect(csw_valid_idx, entropy_idx)
+```
+
+```{r}
+#| echo: false
+#| eval: true
+
+final_feat_tbl <- read_rds(paste0(addr, "AFML/main/data/final_feat_tbl.rds"))
+final_events_idx <- read_rds(paste0(addr, "AFML/main/data/final_events_idx.rds"))
+
+x <- final_feat_tbl |> 
+  mutate(
+    cumret = cumsum(log_ret)
+  ) |> 
+  select(Index, cumret)
+
+x.xts <- xts(x$cumret, order.by = x$Index)
+y.point <- x.xts[final_events_idx]
+
+highchart(
+  type = "stock"
+) |> 
+  hc_rangeSelector(
+    selected = 4,
+    dropdown = "always",
+    buttonTheme = list(
+      r = 3,
+      states = list(
+        hover = list(
+          fill = "#4a4a4a", # 배경색
+          style = list(color = "#FFFFFF") # 글자색
+        ),
+        select = list(
+          fill = "#E0E0E0",
+          style = list(
+            color = "#2b2b2b",
+            fontWeight = "bold"
+          )
+        )
+      )
+    ),
+    x = 20
+  ) |> 
+  hc_title(text = "이벤트 표본 추출",
+           style = list(fontSize = "25px", fontWeight = "bold"),
+           align = "left", x = 20, y = 30) |> 
+  hc_add_series(x.xts, type = "line", name = "ETF 누적 로그 수익률") |> 
+  hc_add_series(y.point, type = "scatter", color = "red", name = "이벤트 발생 시점") |> 
+  hc_legend(
+    enabled = TRUE,
+    layout = "vertical",
+    align = "left",
+    verticalAlign = "top",
+    floating = TRUE,
+    x = 10,
+    y = 10,
+    backgroundColor = "rgba(0,0,0,0)",
+    itemStyle = list(
+      color = "#E0E0E0",
+      fontSize = "15px"
+    ),
+    symbolHeight = 10,
+    symbolWidth = 10,
+    symbolRadius = 2
+  ) |> 
+  hc_tooltip(
+    shape = "rect",
+    headerShape = "callout",
+    shadow = F,
+    fixed = TRUE,
+    borderWidth = 0.1,
+    valueDecimals = 2,
+    style = list(
+      fontSize = "13px"
+    )
+  ) |> 
+  hc_add_theme(hc_theme_darkunica())
+```
+
+::: {.style style="margin-bottom = 20px"}
+:::
+
+#### 4. 이벤트 테이블 구성
+
+-   각 이벤트에 대해 $t_0$(이벤트 발생 시점), $t_1$(최대 보유 기간), `trgt`(변동성 스케일, 임계치), `side`(방향)를 갖는 메타 테이블을 구성한다.
+-   triple-barrier`규칙으로 메타 라벨`bin\`을 생성한다.
+
+최종적으로 모델 입력 테이블은 아래 형태가 된다.
+
+-   `final_tbl`: `bin`(목표) + `feat_*`(설명변수)
+
+> 학습 표본은 "모든 날짜"가 아니라, 정보가 있다고 판단되는 이벤트 시점들이며, 각 표본은 서로 독립적이지 않기 때문에(기간 중첩) 별도의 검증 장치가 필요하다.
+
+```{r}
+### 이벤트 테이블 생성
+events_feat_tbl <- final_feat_tbl[final_events_idx, ] |> 
+  select(-log_ret, -log_ret_konto_entropy)
+
+events_meta_tbl <- events_feat_tbl |> 
+  select(Index) |> 
+  mutate(
+    t1 = map_vec(Index, ~ add_vertical_barrier(.x, final_feat_tbl$Index, num_days = 10)),
+    trgt = rolling_sd[final_events_idx],
+    side = events_feat_tbl$side
+  ) |> 
+  `colnames<-`(c("t0", "t1", "trgt", "side"))
+
+### 메타 레이블링
+events_meta_tbl <- events_meta_tbl |> 
+  mutate(
+    ret = map2(
+      t0, t1, 
+      ~ final_feat_tbl |> 
+        dplyr::filter(Index >= .x & Index <= .y) |> 
+        dplyr::pull(log_ret)
+    ),
+    bin = pmap_dbl(
+      list(ret, trgt, side),
+      ~ apply_pt_sl_on_t1(..1, ..2, ..3, ptsl = c(1.5,1.))
+    )
+  ) |> 
+  na.omit()
+```
+
+### 5.3 라벨 분포 및 표본 수
+
+메타 라벨 `bin`은 "해당 side 베팅이 triple-barrier 기준으로 유효했는가"를 의미하는 이진 변수다. 따라서 클래스 비율(불균형 여부)과 표본 수는 결과 해석에 중요한 선행 정보다.
+
+-   이벤트 수: `nrow(events_meta_tbl)`
+-   클래스 분포: `table(events_meta_tbl$bin)`
+
+라벨 불균형이 클 경우, 단순 accuracy는 과대평가될 수 있으므로 확률 예측 품질을 반영하는 지표인 **Log loss**를 주요 지표로 사용한다.
+
+### 5.4 표본 중복과 고유도(uniqueness) 가중치
+
+이벤트는 $[t_0,t_1]$ 구간을 갖기 때문에 서로 시간 구간이 겹치는 표본(overlapping labels)이 다수 발생한다. 이 경우 단순한 표본 수 기준의 학습/검증은 **중복 표본이 과도하게 학습에 기여**하는 편향을 만들 수 있다.
+
+이를 통제하기 위해 AFML 방식대로 **indicator Matrix**(`indM`)를 구성하고, 이벤트별 평균 고유도(avg uniqueness)를 계산하여 가중치로 사용한다.
+
+표본 추출된 이벤트 시점들이 **서로 겹칠수록(독립성이 높을수록) 더 작은 가중치**를 갖는다. 모델 학습(`case.weights`)과 성능 평가(가중 정확도, 가중 LogLoss) 모두에 동일한 가중치 체계를 적용해 "중복 표본의 영향"을 줄인다.
+
+- 관련 함수
+  - `getIndMatrix`: 이벤트 시점별 겹치는 횟수 계산, `indM` 배열 반환.
+  - `getAvgUniqueness_indM`: `indM` 배열을 통해 이벤트 시점별 고유도 계산
+  
+```{r}
+### 이벤트별 평균 고유도 계산
+indM <- getIndMatrix(index = final_feat_tbl$Index, 
+                     events = events_meta_tbl |> select(t0,t1))
+
+avgU <- getAvgUniqueness_indM(indM)
+
+### 정규화
+avgU <- avgU/mean(avgU,na.rm = T) 
+```
+
+### 5.5 교차검증: Purged K-Fold + Embargo
+
+일반적인 K-Fold는 금융 이벤트 라벨이 구간 $[t_0,t_1]$을 가지는 경우, 학습/테스트가 시간적으로 인접하거나 일부 중첩되면서 **정보 누수(leakage)**가 발생할 수 있다. 이를 방지하기 위해 AFML에서는 **Purged K-Fold**를 사용해 **시간 중첩을 제거**한 OOS평가를 수행한다.
+
+- 일반 K-Fold와 차이점
+  - **Purging**
+    - 테스트 fold의 이벤트 $[t_0,t_1]$와 **시간이 겹치는** 학습 이벤트를 **학습셋에서 제거**한다.
+    - 목적: 테스트 라벨 생성에 사용된 정보가 학습에 섞이는 것을 차단
+  - **Embargo** (예: 1%)
+    - 테스트 구간이 끝난 직후의 학습 표본을 추가로 제외한다.
+    - 목적: 시장 미시구조, 지연 반응 등 겹치지 않더라도 생길 수 있는 **간접 누수** 완화
+
+이를 통해 Purged K-Fold + Embargo는 단순 분할을 넘어서 이벤트의 시간 구간 중첩을 고려한 **더 현실적인 OSS 검증**을 가능하게 한다.
+
+- 관련 함수
+  - `PurgedKFold(events, n_splits, pctEmbargo)`
+    - `events`: 각 이벤트의 $[t_0,t_1]$ 정보
+    - `n_splits`: 분할 개수
+    - `pctEmbargo`: 엠바고 비율
+
+```{r}
+### 제거된 k-fold 교차 검증 인덱스 생성
+cv_fold <- PurgedKFold(events = events_meta_tbl |> select(t0,t1), 
+                       n_splits = 3, 
+                       pctEmbargo = 0.01)
+```
+
+### 5.6 순차적 부트스트랩(Sequential Bootstrap)
+
+금융 이벤트 데이터는 각 표본이 단일 시점이 아니라 $[t_0,t_1]$ 시간 구간을 가지며, 이벤트들끼리 서로 중접(overlap)되는 경우가 많다. 이런 구조에서 일반적인 무작위 부트스트랩은 같은 시간에 몰린 이벤트를 반복적으로 뽑아 유효 표본 수를 과대평가하고 학습을 왜곡할 수 있다.
+
+이를 완화하기 위해 AFML에서는 고유도(uniqueness)를 고려한 순차적 부트스트랩을 사용한다.
+
+- 각 이벤트가 차지하는 시간 구간이 다른 이벤트와 얼마나 겹치는지 계산(`indM` 배열)
+- 부트스트랩 표본을 하나씩 뽑을 때, 이미 뽑힌 이벤트들과 겹침이 적어 고유도가 높은 이벤트에 더 높은 선택 확률을 부여
+- 결과적으로 특정 구간에 표본이 과도하게 몰리는 현상과 중복 이벤트만 반복 추출되는 문제를 줄인다.(더 IID한 표본 생성 가능)
+- 관련 함수
+  - `sequentialBootstrap`: 고유도를 반영해 이벤트를 순차적으로 샘플링
+  - `getBootstrappedTrainIdx`: 순차적 부트스트랩으로 생성된 Train Index 반환
+
+```{r}
+## 훈련 데이터 순차적 부트스트랩 적용
+boot_idx <- getBootstrappedTrainIdx(cv_fold,
+                                    indM, 
+                                    num.threads = 5)
+
+### 최종 훈련/검증 셋
+final_splits <- map2(
+  cv_fold,
+  boot_idx,
+  ~list(
+    train_idx = .y,
+    test_idx = .x$test
+  )
+)
+
+## 최종 훈련 테이블 생성
+final_tbl <- events_meta_tbl |> 
+  select(bin, t0) |> 
+  left_join(events_feat_tbl, by = join_by(t0==Index)) |> 
+  select(bin, contains("feat")) |> 
+  mutate(bin = as.factor(bin))
+```
+
+## 6. 특성 중요도
+
+> 백테스트는 연구 도구가 아니다. 특성 중요도가 연구 도구다. -프라도-
+
+모델을 바로 학습시키기 전에 특성 중요도(Feature Importance)를 먼저 점검해야 한다. 이유는 단순하다. 금융 데이터에서는 우연(노이즈)로도 성능이 잘 나올 수 있고, 그 성능이 어떤 특성에 의해 만들어졌는지를 모르면 재현도, 해석도, 개선도 불가능하기 때문이다.
+
+특성 중요도는 다음 질무에 답하는 핵심 도구이다.
+
+-   **어떤 특성이 예측에 실제로 기여하는가?**
+-   **특성이 유효한 신호인가, 혹은 데이터 누수/과최적화의 산물인가?**
+-   **특성을 제거**$\cdot$교체 했을 때 성능이 얼마나 변하는가?
+-   **특성 추가가 성능을 높이는지, 오히려 잡음을 늘리는지?**
+
+백테스트는 결과만 보여주지만, **특성 중요도는 원인(신호의 근거)**을 보여준다. 그래서 모델을 돌리기 전에, 그리고 새로운 특성을 추가할 떄마다 반복적으로 특성 중요도를 통해 연구 루프(가설-\>검증-\>개선)를 돌리는 것이 AFML의 핵심 절차다.
+
+### 6.1 특성 중요도 지표
+
+특성 중요도를 측정하기 위해 **확률 예측의 질**이 중요하기에 다음 지표를 사용한다.
+
+#### **Log-Loss(Negative Log-Loss, NLL)** score
+
+-   성능 지표 Accuracy는 보통 **임계값 (예: 0.5)** 으로 라벨로 변환해 평가하므로, **확률의 확신 정도(0.51 vs 0.99) 차이를 충분히 반영하지 못한다.**
+-   이를 보완하기 위해, 정답 클래스에 부여한 확률이 낮을수록 더 큰 패널티를 주는 **Log-Loss**를 사용한다.
+-   Log-Loss는 0 이상의 값을 가지며, 0에 가까울수록 좋은 모델이다.
+-   Log-Loss를 score 지표로 사용하기 위해 부호를 바꿔 사용하도록 한다. 즉, 클수록 좋은 모델이다.
+- `featImportance`
+  - `data`: 특징 테이블
+  - `cv`: 학습/훈련 분할 index list
+  - `case_weights`: 샘플 가중치 vector
+  - `method`: 특성 중요도 측정 기법으로 MFI/MFA/SFI 중 선택
+- `cvScore`: 모델의 NLL Score 반환
+
+#### 1. MDI(Mean Decrease Impurity, 평균 감소 불순도)
+
+-   빠른 설명적-중요도 방법으로 In-Sample 이다.
+-   랜덤포레스트(RF)는 개별 노드에서 선택된 특성들은 자신의 부분 집합을 불순도가 감소하는 방향으로 분할
+-   이를 통해 각 트리별로 개별 특성이 얼마나 전체 불순도 감소에 기여했는지 계산이 가능
+-   **개별 특성이 얼마나 불순도를 감소시켰는지에 대한 지표**
+- `featImpMDI`
+
+#### 2. MDA(Mean Decrease Accuracy, 평균 감소 정확도)
+
+-   **Out-Of-Sample(OOS) 기반의 느리지만 신뢰도 높은** 특성 중요도 방법이다.
+-   각 특성을 **무작위로 섞어(permutation, 순열)** 정보성을 제거한 뒤, OOS 성능 하락폭으로 중요도를 측정한다.
+-   즉, **단일 특성을 순열 했을 때, 기존 성능이 얼마나 나빠지는가**
+-   **MDA가 음수일 경우 해당 특성이 실제로 모델 예측력에 해롭게 작용했다는 의미**
+-   계산 절차
+    1.  (Purged) K-Fold로 학습
+    2.  샘플 외 성과(OOS) 계산 : `base_score`
+    3.  각 특성별로 한 번에 한 열씩 순열을 취한 뒤 OOS 계산: `perm_score`
+    4.  순열 이전과 이후 OOS를 비교: `imp = perm_score - base_score`
+- `featImpMDA`
+
+#### 3. SFI(Single Feature Importance, 단일 특성 중요도)
+
+-   **특성 하나만 사용**하여 모델을 학습하고 OOS를 계산한다.
+-   MDI, MDA와 다르게 **대체 효과(결합 효과, 계층적 중요도)가 없으며** 이는 한 번에 하나의 특성만 고려하기 때문이다.
+-   단점은 특성 간 상호작용을 포착하기 어렵고, 실제 다변량 모델에서 차이가 발생 가능하다.
+- `featImpSFI`
+
+### 6.2 재현성 확보: 반복 실험(replicate)
+
+랜덤 포레스트와 부트스트랩은 랜덤성을 내재하므로, 단일 실험 결과만으로 결론을 내리기 어렵다. 따라서 동일한 검증 설정에서 반복 실험을 수행하고, OOS 지표의 평균/분산을 함께 산출한다.
+
+-   `future_replicate(10, ...)` 형태로 10회 반복
+-   중요도/성능을 평균과 표준편차로 요약하여 우연한 한 번의 결과 경계
+
+### 6.3 실험 결과
+
+#### 1. MDI
+
+```{r}
+### 병렬 처리 시작
+plan(multisession, workers = 5)
+
+res <- future.apply::future_replicate(10, 
+                               featImportance(data = final_tbl, 
+                                              cv = final_splits, 
+                                              case_weights = avgU, 
+                                              method = "MDI"),
+                               simplify = F)
+
+### 병렬 처리 종료
+plan(sequential)
+
+imp <- reduce(lapply(1:10, function(x) res[[x]]$Importance), rbind)
+oos <- reduce(lapply(1:10, function(x) res[[x]]$OutofSample), mean)
+
+imp_mdi <- list(
+  imp = imp |> 
+  group_by(feature) |> 
+  summarise(imp_mean = mean(mean),
+            imp_sd = mean(std),
+            .groups = "drop") |>
+  arrange(imp_mean) |> 
+  mutate(feature = fct_inorder(feature)),
+  oos = oos)
+```
+
+```{r}
+#| echo: false
+#| eval: true
+#| fig-width: 8
+
+imp_mdi <- read_rds(paste0(addr, "AFML/main/data/imp_mdi.rds"))
+
+### plot
+ggplot(imp_mdi[[1]], aes(x = feature, y = imp_mean)) +
+  geom_col(width = 0.75) +
+  geom_errorbar(
+    aes(ymin = imp_mean - imp_sd, ymax = imp_mean + imp_sd),
+    width = 0.2, linewidth = 0.4, alpha = 0.8
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.02)),
+    labels = label_number(accuracy = 0.001)) +
+  labs(title = paste0("MDI-OOS: ", round(imp_mdi[[2]], 4))) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+- ACF 계열, RSI 기반 외생 변수, Hurst 같은 특징이 상단에 위치해 있으며 대부분의 특징이 안정적인 성능을 보인다.
+
+#### 2. MDA
+
+```{r}
+### 병렬 처리 시작
+plan(multisession, workers = 5)
+
+res <- future.apply::future_replicate(10, 
+                               featImportance(data = final_tbl, 
+                                              cv = final_splits, 
+                                              case_weights = avgU, 
+                                              method = "MDA"),
+                               simplify = F)
+
+### 병렬 처리 종료
+plan(sequential)
+
+imp <- reduce(lapply(1:10, function(x) res[[x]]$Importance), rbind)
+oos <- reduce(lapply(1:10, function(x) res[[x]]$OutofSample), mean)
+
+imp_mda <- list(
+  imp = imp |> 
+  group_by(feature) |> 
+  summarise(imp_mean = mean(mean),
+            imp_sd = mean(std),
+            .groups = "drop") |>
+  arrange(imp_mean) |> 
+  mutate(feature = fct_inorder(feature)),
+  oos = oos)
+```
+
+```{r}
+#| echo: false
+#| eval: true
+#| fig-width: 8
+
+imp_mda <- read_rds(paste0(addr, "AFML/main/data/imp_mda.rds"))
+
+### plot
+ggplot(imp_mda[[1]], aes(x = feature, y = imp_mean)) +
+  geom_col(width = 0.75) +
+  geom_errorbar(
+    aes(ymin = imp_mean - imp_sd, ymax = imp_mean + imp_sd),
+    width = 0.2, linewidth = 0.4, alpha = 0.8
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.02)),
+    labels = label_number(accuracy = 0.001)) +
+  labs(title = paste0("MDA-OOS: ", round(imp_mda[[2]], 4))) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+- 음수인 특징들은 오히려 모델을 해롭게 하는 특징들로 우선적으로 제거해야 하는 것들이다.
+
+#### 3. SFI
+
+```{r}
+### 병렬 처리 시작
+plan(multisession, workers = 5)
+
+res <- future.apply::future_replicate(10, 
+                               featImportance(data = final_tbl, 
+                                              cv = final_splits, 
+                                              case_weights = avgU, 
+                                              method = "SFI"),
+                               simplify = F)
+
+### 병렬 처리 종료
+plan(sequential)
+
+imp <- reduce(lapply(1:10, function(x) res[[x]]$Importance), rbind)
+oos <- reduce(lapply(1:10, function(x) res[[x]]$OutofSample), mean)
+
+imp_sfi <- list(
+  imp = imp |> 
+  group_by(feature) |> 
+  summarise(imp_mean = mean(mean),
+            imp_sd = mean(std),
+            .groups = "drop") |>
+  arrange(imp_mean) |> 
+  mutate(feature = fct_inorder(feature)),
+  oos = oos)
+```
+
+```{r}
+#| echo: false
+#| eval: true
+#| fig-width: 8
+
+imp_sfi <- read_rds(paste0(addr, "AFML/main/data/imp_sfi.rds"))
+
+### plot
+ggplot(imp_sfi[[1]], aes(x = feature, y = imp_mean)) +
+  geom_col(width = 0.75) +
+  geom_errorbar(
+    aes(ymin = imp_mean - imp_sd, ymax = imp_mean + imp_sd),
+    width = 0.2, linewidth = 0.4, alpha = 0.8
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.02)),
+    labels = label_number(accuracy = 0.001)) +
+  labs(title = paste0("SFI-OOS: ", round(imp_sfi[[2]], 4))) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+- SFI는 단일 특성의 OOS를 의미하므로 0에 가까울수록 모델에 개선하는 특징들이다.
+
+#### 4. 개선
+
+특징 중요도 기법 중 특성을 무력화했을 때 OOS 성능이 얼마나 악화되는가를 직접 측정하는 MDA가 가장 중요하다. 즉, **MDA가 특성 제거/축소 의사결정에 가장 직접적으로 연결된다.**
+
+반면,
+
+- **MDI**는 학습 과정에서의 불순도 감소를 기반으로 하므로 **제거 효과를 직접 의미하지 않으며**(편향 가능)
+- **SFI**는 "단일 특성만으로 낼 수 있는 OOS 성능"으로 **독립적 신호의 존재를 점검**하는 용도에 가깝고, 다변량 조합에서의 기여와는 차이가 날 수 있다.
+
+따라서 개선 단계에서는 **MDA를 기준으로 후보 특성을 정리**하되, MDI/SFI는 (1) 편향 점검, (2) 상관$\cdot$대체효과 진단을 위한 보조 지표로 활용한다.
+
+```{r}
+temp_tbl <- final_tbl |> 
+  select(-c(feat_exo_D_usdkrw_rsi_50,
+            feat_endo_x_acf10,
+            feat_endo_x_acf1,
+            feat_endo_hurst,
+            feat_endo_entropy,
+            feat_endo_MFI,
+            feat_endo_stability,
+            feat_exo_D_institutional_rsi_50,
+            feat_endo_diff2_acf1,
+            feat_exo_D_retail_rsi_50,
+            feat_endo_ffd,
+            feat_exo_D_foreign_rsi_50))
+
+### 병렬 처리 시작
+plan(multisession, workers = 5)
+
+res <- future.apply::future_replicate(10, 
+                               featImportance(data = temp_tbl, 
+                                              cv = final_splits, 
+                                              case_weights = avgU, 
+                                              method = "MDA"),
+                               simplify = F)
+
+### 병렬 처리 종료
+plan(sequential)
+
+imp <- reduce(lapply(1:10, function(x) res[[x]]$Importance), rbind)
+oos <- reduce(lapply(1:10, function(x) res[[x]]$OutofSample), mean)
+
+imp_mda_mod <- list(
+  imp = imp |> 
+  group_by(feature) |> 
+  summarise(imp_mean = mean(mean),
+            imp_sd = mean(std),
+            .groups = "drop") |>
+  arrange(imp_mean) |> 
+  mutate(feature = fct_inorder(feature)),
+  oos = oos)
+```
+
+```{r}
+#| echo: false
+#| eval: true
+#| fig-width: 8
+
+imp_mda_mod <- read_rds(paste0(addr, "AFML/main/data/imp_mda_mod.rds"))
+
+### plot
+ggplot(imp_mda_mod[[1]], aes(x = feature, y = imp_mean)) +
+  geom_col(width = 0.75) +
+  geom_errorbar(
+    aes(ymin = imp_mean - imp_sd, ymax = imp_mean + imp_sd),
+    width = 0.2, linewidth = 0.4, alpha = 0.8
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.02)),
+    labels = label_number(accuracy = 0.001)) +
+  labs(title = paste0("Modified MDA-OOS: ", round(imp_mda_mod[[2]], 4))) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+- MDA기반으로 중요도가 낮은 변수를 순차적으로 제거한 결과, **OOS Score가 -0.6162로 개선**되었다. 이는 초기 특성 집합에 잡음(또는 대체 가능한 정보)이 포함되어 있었고, 제거를 통해 일반화 성능이 향상되었음을 시사한다.
+- 현재 남은 변수 중에서는 `feat_endo_lumpiness`(구간별 분산들의 분산), `feat_endo_diff2_acf10`(2차 차분 시계열의 lag 1 ~ 10 autocorr의 제곱합)의 중요도가 상대적으로 높아, 해당 특성이 OOS성능에 가장 크게 기여한 것으로 보인다.
+- 다만 변수들의 **폴드 간 변동이 커서** 중요도가 구간/레짐에 따라 달라질 가능성이 있다.
+
+# 결론
+
+본 프로젝트에서 드러난 문제점들은 명확하다.
+
+- **유효 표본수 붕괴**: 초기 **약 3,000개 이벤트** -> 이벤트 샘플링과 누수 방지 절차 적용 후 학습 가능 **이벤트가 60개 수준으로 축소**
+- 일별 타임바 한계: 시간 해상도가 낮아 이벤트 생성/라벨링이 제약되고, 중첩$\cdot$필터링 영향이 커져 표본이 급감
+
+이번 결과의 핵심 한계는 **일별 타임바(time bar)** 기반 데이터 구조에 있다. 일별 해상도에서는 이벤트 간 중첩, 필터링, 라벨 구간 $[t_0,t_1]$ 제약이 겹치며 유효 표본 수가 급격히 감소한다. 향후에는 **틱 데이터 기반 달러바(dollar bar)**로 관측 단위를 세분화하여 이벤트 수와 정보량을 확보한다면, 모델의 안정성과 성능이 **의미 있게 개선될 가능성**이 크다.
+
+이러한 표본 제약으로 인해 다음 단계인 베팅 사이즈(bet sizing) 및 백테스트(backtesting)는 본 실험 설정에서는 실질적으로 구현이 어렵다. 다만 AFML 워크플로우에서 **가장 중요한 구간인 특성 중요도 파트를 실제로 수행**하며, 누수 방지 검증 체계와 중요도 기반 모델 개선을 수행했다는 점에 의의가 있다고 생각한다.
+
+향후 고빈도 알고리즘 구현이라는 AFML의 철학과 일치하게 **적절한 틱 데이터를 수집해 나만의 가설을 수립하고 머신러닝을 통해 가설을 검증함으로써 해당 전략의 타당성을 확인**할 것이다. 이번 프로젝트는 그 목표를 위한 시발점이 될 것이다.
