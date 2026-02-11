@@ -1,3 +1,4 @@
+### 지수가중 이동평균
 ewma <- function(x, alpha = NULL, span = NULL) {
   
   if (!is.null(alpha) && !is.null(span)) {
@@ -22,6 +23,7 @@ ewma <- function(x, alpha = NULL, span = NULL) {
   return(res)
 }
 
+### 지수가중 이동표준편차
 ewmsd <- function(x, alpha = NULL, span = NULL, bias = FALSE) {
   
   # --- 입력 검증 ---
@@ -805,4 +807,3 @@ roll_z <- function(x, window) {
   z[roll_sd ==0] <- NA_real_
   return(z)
 }
-
