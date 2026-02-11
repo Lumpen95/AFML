@@ -61,7 +61,7 @@ ewmsd <- function(x, alpha = NULL, span = NULL, bias = FALSE) {
 # x(Numeric vector): 국지적 정상성을 가진 IID 관측값(로그 수익률)
 # h(Numeric vector): 구조적 변화를 판단할 수 있는 동적 임계값(지수가중 이동표준편차)
 # return(Numeric vector): 이벤트 발생 Index
-sym_cumsum <- function(x, h) {
+sym_cusum <- function(x, h) {
   
   if (!is.numeric(x) || !is.vector(x)) stop("x는 정수형 벡터여야 합니다.")
   if (!is.numeric(h) || !is.vector(h)) stop("h는 정수형 벡터여야 합니다.")
@@ -805,3 +805,4 @@ roll_z <- function(x, window) {
   z[roll_sd ==0] <- NA_real_
   return(z)
 }
+
