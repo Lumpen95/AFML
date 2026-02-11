@@ -1,0 +1,55 @@
+/* =========================
+   Base text / links
+   ========================= */
+
+body {
+  color: #E6E6E6;
+}
+
+strong, b {
+  color: #F8F9FA;
+}
+
+p {
+  color: #F8F9FA;
+}
+
+a {
+  color: #4DB6AC;
+  text-decoration: none;
+}
+a:hover {
+  color: #81CFC4;
+  text-decoration: underline;
+}
+
+h1, h2, h3, h4, h5 {
+  color: #F3F6FA;
+  margin-bottom: 1rem;
+}
+
+h2 {
+  border-bottom-width: 0.2rem;
+  border-bottom-color: #F3F6FA;
+}
+
+code {
+  background: rgba(77, 182, 172, 0.18) !important;   /* 링크색 계열로 살짝 틴트 */
+  color: #FFFFFF !important;                          /* 텍스트 확 밝게 */
+  border: 1px solid rgba(77, 182, 172, 0.55) !important;
+  padding: 0.18em 0.42em !important;
+  border-radius: 9px !important;
+  font-size: 0.9rem;
+}
+
+:not(pre) > code:hover {
+  background: rgba(77, 182, 172, 0.26) !important;
+  border-color: rgba(129, 207, 196, 0.75) !important;
+}
+
+.code-copy-button:hover {
+  background: rgba(77,182,172,0.18) !important;
+  border-color: rgba(77,182,172,0.45) !important;
+}
+
+
