@@ -10,7 +10,7 @@ format:
     code-links: 
       - text: "GitHub (source code)"
         icon: github
-        href: "https://github.com/Lumpen95/AFML/blob/main/%5BAFML%5D%20KODEX%20%EB%B0%98%EB%8F%84%EC%B2%B4%20ETF%20%EC%98%88%EC%B8%A1%20%EB%AA%A8%EB%8D%B8%EB%A7%81.qmd"
+        href: "https://raw.githubusercontent.com/Lumpen95/AFML/main/KODEX 반도체 ETF 예측 모델링.qmd"
 ---
 
 # 개요
@@ -1276,4 +1276,5 @@ ggplot(imp_mda_mod[[1]], aes(x = feature, y = imp_mean)) +
 이러한 표본 제약으로 인해 다음 단계인 베팅 사이즈(bet sizing) 및 백테스트(backtesting)는 본 실험 설정에서는 실질적으로 구현이 어렵다. 다만 AFML 워크플로우에서 **가장 중요한 구간인 특성 중요도 파트를 실제로 수행**하며, 누수 방지 검증 체계와 중요도 기반 모델 개선을 수행했다는 점에 의의가 있다고 생각한다.
 
 향후 고빈도 알고리즘 구현이라는 AFML의 철학과 일치하게 **적절한 틱 데이터를 수집해 나만의 가설을 수립하고 머신러닝을 통해 가설을 검증함으로써 해당 전략의 타당성을 확인**할 것이다. 이번 프로젝트는 그 목표를 위한 시발점이 될 것이다.
+
 
